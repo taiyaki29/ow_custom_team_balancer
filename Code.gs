@@ -51,7 +51,19 @@ const PREFERENCE_MAP = {
   '○': '○',
 };
 
+const RANK_TIERS = [
+  ['bronze', 'ブロンズ'],
+  ['silver', 'シルバー', 'silver'],
+  ['gold', 'ゴールド'],
+  ['platinum', 'プラチナ', 'plat', 'プラ'],
+  ['diamond', 'ダイヤ', 'ダイヤモンド', 'dia'],
+  ['master', 'マスター'],
+  ['grandmaster', 'グランドマスター', 'グラマス', 'gm', 'グランドマスタ'],
+  ['champion', 'チャンピオン', 'チャン'],
+];
+
 const RANK_POINTS = buildRankPointsMap_();
+const POINTS_TO_RANK_LIST = buildPointsToRankList_();
 
 function onOpen() {
   SpreadsheetApp.getUi()
@@ -351,19 +363,8 @@ function parseRankKey_(key) {
 }
 
 function buildRankPointsMap_() {
-  const tiers = [
-    ['bronze', 'ブロンズ'],
-    ['silver', 'シルバー', 'silver'],
-    ['gold', 'ゴールド'],
-    ['platinum', 'プラチナ', 'plat', 'プラ'],
-    ['diamond', 'ダイヤ', 'ダイヤモンド', 'dia'],
-    ['master', 'マスター'],
-    ['grandmaster', 'グランドマスター', 'グラマス', 'gm', 'グランドマスタ'],
-    ['champion', 'チャンピオン', 'チャン'],
-  ];
-
   const map = {};
-  tiers.forEach((aliases, tierIdx) => {
+  RANK_TIERS.forEach((aliases, tierIdx) => {
     for (let div = 5; div >= 1; div--) {
       const points = tierIdx * 5 + (6 - div);
       aliases.forEach(alias => {
@@ -373,6 +374,49 @@ function buildRankPointsMap_() {
     }
   });
   return map;
+}
+
+function buildPointsToRankList_() {
+  const list = [];
+  RANK_TIERS.forEach((aliases, tierIdx) => {
+    const labelBase = aliases[1] || aliases[0];
+    for (let div = 5; div >= 1; div--) {
+      list.push({
+        points: tierIdx * 5 + (6 - div),
+        label: `${labelBase}${div}`,
+      });
+    }
+  });
+  return list.sort((a, b) => a.points - b.points);
+}
+
+function pointsToRankLabel_(points) {
+  const rounded = Math.round(points);
+  let closest = POINTS_TO_RANK_LIST[0];
+  let minDiff = Math.abs(rounded - closest.points);
+  POINTS_TO_RANK_LIST.forEach(entry => {
+    const diff = Math.abs(rounded - entry.points);
+    if (diff < minDiff) {
+      minDiff = diff;
+      closest = entry;
+    }
+  });
+  return closest.label;
+}
+
+function teamAverageRankLabel_(team) {
+  if (!team || team.length === 0) return '';
+  const avg = team.reduce((sum, p) => sum + effectiveScore_(p), 0) / team.length;
+  return pointsToRankLabel_(avg);
+}
+
+function getTeamsInColumnOrder_(balancedLobbies) {
+  const teams = [];
+  balancedLobbies.forEach(lobby => {
+    teams.push(lobby.teamA);
+    teams.push(lobby.teamB);
+  });
+  return teams;
 }
 
 function getSwapAttempts_(playerCount) {
@@ -592,7 +636,17 @@ function buildBalancedGrid_(balancedLobbies, lobbySize) {
     return row;
   });
 
-  return { headers: headers, rows: gridRows, teamCount: teamCount, matchCount: balancedLobbies.length };
+  const teams = getTeamsInColumnOrder_(balancedLobbies);
+  const avgRow = ['平均'].concat(teams.map(team => teamAverageRankLabel_(team)));
+  gridRows.push(avgRow);
+
+  return {
+    headers: headers,
+    rows: gridRows,
+    teamCount: teamCount,
+    matchCount: balancedLobbies.length,
+    roleRowCount: roleSlots.length,
+  };
 }
 
 function writeBalancedLobbies_(ss, balancedLobbies, partialLobbies, lobbySize) {
@@ -637,10 +691,10 @@ function writeBalancedLobbies_(ss, balancedLobbies, partialLobbies, lobbySize) {
     lastRow = extraRow;
   }
 
-  formatBalancedOutputSheet_(sheet, colCount, lastRow, grid.rows.length);
+  formatBalancedOutputSheet_(sheet, colCount, lastRow, grid.roleRowCount);
 }
 
-function formatBalancedOutputSheet_(sheet, colCount, lastRow, dataRowCount) {
+function formatBalancedOutputSheet_(sheet, colCount, lastRow, roleRowCount) {
   if (colCount < 1) return;
 
   sheet.autoResizeColumns(1, colCount);
@@ -662,13 +716,21 @@ function formatBalancedOutputSheet_(sheet, colCount, lastRow, dataRowCount) {
   sheet.getRange(1, 1, 1, colCount).setFontSize(9);
   sheet.getRange(1, 1, 1, 1).setFontWeight('bold');
 
-  if (dataRowCount > 0) {
-    const body = sheet.getRange(3, 1, dataRowCount, colCount);
-    body.setVerticalAlignment('top');
-    sheet.getRange(3, 1, dataRowCount, 1).setHorizontalAlignment('center');
+  if (roleRowCount > 0) {
+    sheet.getRange(3, 1, roleRowCount, colCount).setVerticalAlignment('top');
+    sheet.getRange(3, 1, roleRowCount, 1).setHorizontalAlignment('center');
     if (colCount > 1) {
-      sheet.getRange(3, 2, dataRowCount, colCount - 1).setWrap(true);
+      sheet.getRange(3, 2, roleRowCount, colCount - 1).setWrap(true);
     }
+  }
+
+  const avgRowNum = 3 + roleRowCount;
+  if (roleRowCount > 0) {
+    const avgRow = sheet.getRange(avgRowNum, 1, 1, colCount);
+    avgRow.setFontWeight('bold');
+    avgRow.setBackground('#e8f0fe');
+    avgRow.setHorizontalAlignment('center');
+    sheet.getRange(avgRowNum, 1).setHorizontalAlignment('center');
   }
 
   sheet.setFrozenRows(2);
