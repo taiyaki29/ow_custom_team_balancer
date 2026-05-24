@@ -1,14 +1,12 @@
 /**
- * Overwatch カスタム用 TSV 変換スクリプト
- * ランダム分割 / ランクバランス分割 → タブ出力
+ * Overwatch カスタム用チーム作成スクリプト
+ * ランク・ロールバランス分割 → タブ出力
  */
 
 const CONFIG = {
   SOURCE_SHEET: 'フォームの回答 1',
-  OUTPUT_SHEET_PREFIX: 'TSV出力_',
-  BALANCED_OUTPUT_SHEET: 'バランス出力',
-  BALANCED_OUTPUT_SHEET_PREFIX: 'バランス出力',
-  LOBBY_SPREAD_WEIGHT: 2,
+  OUTPUT_SHEET: 'バランス出力',
+  OUTPUT_SHEET_PREFIX: 'バランス出力',
   TIE_EPSILON: 2,
   DEFAULT_RANK_POINTS: 18,
 };
@@ -46,8 +44,6 @@ const ROLE_LABELS = {
   support: 'サポート',
 };
 
-const BALANCED_SHEET_HEADERS = ['ロビー', 'チーム', '役割'].concat(TSV_HEADERS, ['スコア']);
-
 const PREFERENCE_MAP = {
   'いいえ': '×',
   'やってもいい': '○',
@@ -60,22 +56,11 @@ const RANK_POINTS = buildRankPointsMap_();
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu('チーム作成')
-    .addItem('10人でランダム分割', 'createTsvSheet10')
-    .addItem('12人でランダム分割', 'createTsvSheet12')
+    .addItem('10人でチーム作成', 'createBalancedTsvSheet10')
+    .addItem('12人でチーム作成', 'createBalancedTsvSheet12')
     .addSeparator()
-    .addItem('10人でバランス分割', 'createBalancedTsvSheet10')
-    .addItem('12人でバランス分割', 'createBalancedTsvSheet12')
-    .addSeparator()
-    .addItem('TSVをDriveに保存（全タブ）', 'exportTsvToDrive')
+    .addItem('TSVをDriveに保存', 'exportTsvToDrive')
     .addToUi();
-}
-
-function createTsvSheet10() {
-  createTsvSheet_(10);
-}
-
-function createTsvSheet12() {
-  createTsvSheet_(12);
 }
 
 function createBalancedTsvSheet10() {
@@ -84,26 +69,6 @@ function createBalancedTsvSheet10() {
 
 function createBalancedTsvSheet12() {
   createBalancedTsvSheet_(12);
-}
-
-function createTsvSheet_(teamSize) {
-  const rows = loadPlayerRows_();
-  if (!rows) return;
-
-  const shuffled = shuffleRows_(rows);
-  const chunks = chunkRows_(shuffled, teamSize);
-
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  deleteOutputSheets_(ss, CONFIG.OUTPUT_SHEET_PREFIX);
-  writeChunkSheets_(ss, chunks, CONFIG.OUTPUT_SHEET_PREFIX);
-
-  const summary = chunks
-    .map((chunk, i) => `${CONFIG.OUTPUT_SHEET_PREFIX}${i + 1}: ${chunk.length}人`)
-    .join('\n');
-
-  SpreadsheetApp.getUi().alert(
-    `${teamSize}人ずつ・ランダムで ${chunks.length} タブを作成しました（合計 ${rows.length}人）\n\n${summary}\n\nもう一度押すと別の組み合わせになります`
-  );
 }
 
 function createBalancedTsvSheet_(lobbySize) {
@@ -150,7 +115,7 @@ function createBalancedTsvSheet_(lobbySize) {
   });
 
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  deleteOutputSheets_(ss, CONFIG.BALANCED_OUTPUT_SHEET_PREFIX);
+  deleteOutputSheets_(ss, CONFIG.OUTPUT_SHEET_PREFIX);
   writeBalancedLobbies_(ss, balancedLobbies, partialLobbies.concat(roleFailedLobbies), lobbySize);
 
   const lobbySpread =
@@ -161,7 +126,7 @@ function createBalancedTsvSheet_(lobbySize) {
   });
 
   let message =
-    `「${CONFIG.BALANCED_OUTPUT_SHEET}」タブに ${balancedLobbies.length} 試合分を出力しました（合計 ${players.length}人）\n` +
+    `「${CONFIG.OUTPUT_SHEET}」タブに ${balancedLobbies.length} 試合分を出力しました（合計 ${players.length}人）\n` +
     `ロビー間スプレッド: ${lobbySpread}（小さいほど均等）\n` +
     `試合ごとのランク差: ${matchGaps || '—'}\n\n` +
     summaryLines.join('\n') +
@@ -547,39 +512,95 @@ function forEachCombination_(arr, k, fn) {
   search(0, 0);
 }
 
+const ROLE_SORT_ORDER = { tank: 0, dps: 1, support: 2 };
+
 function sortPlayersByRole_(players) {
-  const order = { tank: 0, dps: 1, support: 2 };
   return players.slice().sort((a, b) => {
-    return (order[a.assignedRole] || 9) - (order[b.assignedRole] || 9);
+    const roleCmp =
+      (ROLE_SORT_ORDER[a.assignedRole] ?? 9) - (ROLE_SORT_ORDER[b.assignedRole] ?? 9);
+    if (roleCmp !== 0) return roleCmp;
+    return String(a.row[0]).localeCompare(String(b.row[0]), 'ja');
   });
 }
 
+function getRoleRowSlots_(teamRoleSlots) {
+  const slots = [];
+  for (let i = 0; i < teamRoleSlots.tank; i++) slots.push({ role: 'tank', index: i });
+  for (let i = 0; i < teamRoleSlots.dps; i++) slots.push({ role: 'dps', index: i });
+  for (let i = 0; i < teamRoleSlots.support; i++) slots.push({ role: 'support', index: i });
+  return slots;
+}
+
+function roleSlotLabel_(slot) {
+  return ROLE_LABELS[slot.role];
+}
+
+function groupTeamByRole_(team) {
+  const grouped = { tank: [], dps: [], support: [] };
+  sortPlayersByRole_(team).forEach(p => {
+    if (grouped[p.assignedRole]) grouped[p.assignedRole].push(p);
+  });
+  return grouped;
+}
+
+function getPlayerAtRoleSlot_(team, slot) {
+  const grouped = groupTeamByRole_(team);
+  const list = grouped[slot.role] || [];
+  return list[slot.index] || null;
+}
+
+const ROLE_RANK_COL = { tank: 1, dps: 2, support: 3 };
+
+function assignedRoleRank_(player) {
+  if (!player || !player.assignedRole) return '';
+  const col = ROLE_RANK_COL[player.assignedRole];
+  return String(player.row[col] || '').trim();
+}
+
+function formatPlayerCell_(player) {
+  if (!player) return '';
+  const name = String(player.row[0]);
+  const rank = assignedRoleRank_(player);
+  if (rank) return `${name} (${rank})`;
+  return name;
+}
+
+function countTeams_(balancedLobbies) {
+  return balancedLobbies.length * 2;
+}
+
+function getTeamColumnHeaders_(teamCount) {
+  const headers = [];
+  for (let t = 1; t <= teamCount; t++) {
+    headers.push(`チーム${t}`);
+  }
+  return headers;
+}
+
+function buildBalancedGrid_(balancedLobbies, lobbySize) {
+  const teamRoleSlots = getTeamRoleSlots_(lobbySize / 2);
+  const roleSlots = getRoleRowSlots_(teamRoleSlots);
+  const teamCount = countTeams_(balancedLobbies);
+  const headers = ['役割'].concat(getTeamColumnHeaders_(teamCount));
+
+  const gridRows = roleSlots.map(slot => {
+    const row = [roleSlotLabel_(slot)];
+    balancedLobbies.forEach(lobby => {
+      row.push(formatPlayerCell_(getPlayerAtRoleSlot_(lobby.teamA, slot)));
+      row.push(formatPlayerCell_(getPlayerAtRoleSlot_(lobby.teamB, slot)));
+    });
+    return row;
+  });
+
+  return { headers: headers, rows: gridRows, teamCount: teamCount, matchCount: balancedLobbies.length };
+}
+
 function writeBalancedLobbies_(ss, balancedLobbies, partialLobbies, lobbySize) {
-  const sheet = ss.insertSheet(CONFIG.BALANCED_OUTPUT_SHEET);
-  const colCount = BALANCED_SHEET_HEADERS.length;
-  const dataRows = [];
-
-  balancedLobbies.forEach((lobby, index) => {
-    if (index > 0) {
-      dataRows.push(new Array(colCount).fill(''));
-    }
-    const lobbyNum = index + 1;
-    sortPlayersByRole_(lobby.teamA).forEach(p => {
-      dataRows.push(playerToBalancedRow_(p, 'A', lobbyNum));
-    });
-    sortPlayersByRole_(lobby.teamB).forEach(p => {
-      dataRows.push(playerToBalancedRow_(p, 'B', lobbyNum));
-    });
-  });
-
-  partialLobbies.forEach(lobby => {
-    if (dataRows.length > 0) {
-      dataRows.push(new Array(colCount).fill(''));
-    }
-    lobby.forEach(p => {
-      dataRows.push(playerToBalancedRow_(p, '', '余り'));
-    });
-  });
+  const sheet = ss.insertSheet(CONFIG.OUTPUT_SHEET);
+  const grid = buildBalancedGrid_(balancedLobbies, lobbySize);
+  const colCount = grid.headers.length;
+  const teamCount = grid.teamCount;
+  const matchCount = grid.matchCount;
 
   const lobbySpread =
     balancedLobbies.length > 1
@@ -589,27 +610,68 @@ function writeBalancedLobbies_(ss, balancedLobbies, partialLobbies, lobbySize) {
     balancedLobbies.reduce((n, l) => n + l.players.length, 0) +
     partialLobbies.reduce((n, l) => n + l.length, 0);
 
-  sheet.getRange(1, 1, 1, 4).setValues([
-    [
-      `${lobbySize}人ロビー × ${balancedLobbies.length}試合`,
-      `合計 ${totalPlayers}人`,
-      `ロビー間スプレッド: ${lobbySpread}`,
-      Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy-MM-dd HH:mm'),
-    ],
-  ]);
+  const summaryRow = [
+    `${lobbySize}人ロビー × ${matchCount}試合`,
+    `${teamCount}チーム`,
+    `合計 ${totalPlayers}人`,
+    `ロビー間スプレッド: ${lobbySpread}`,
+    Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy-MM-dd HH:mm'),
+  ];
+  while (summaryRow.length < colCount) summaryRow.push('');
+  sheet.getRange(1, 1, 1, colCount).setValues([summaryRow.slice(0, colCount)]);
 
-  sheet.getRange(2, 1, 1, colCount).setValues([BALANCED_SHEET_HEADERS]);
+  sheet.getRange(2, 1, 1, colCount).setValues([grid.headers]);
 
-  if (dataRows.length > 0) {
-    sheet.getRange(3, 1, dataRows.length, colCount).setValues(dataRows);
+  if (grid.rows.length > 0) {
+    sheet.getRange(3, 1, grid.rows.length, colCount).setValues(grid.rows);
   }
+
+  const extraNames = [];
+  partialLobbies.forEach(lobby => {
+    lobby.forEach(p => extraNames.push(String(p.row[0])));
+  });
+  let lastRow = 2 + grid.rows.length;
+  if (extraNames.length > 0) {
+    const extraRow = 3 + grid.rows.length + 1;
+    sheet.getRange(extraRow, 1, 1, 2).setValues([['余り', extraNames.join(', ')]]);
+    lastRow = extraRow;
+  }
+
+  formatBalancedOutputSheet_(sheet, colCount, lastRow, grid.rows.length);
 }
 
-function playerToBalancedRow_(player, team, lobbyLabel) {
-  const roleLabel = player.assignedRole ? ROLE_LABELS[player.assignedRole] : '';
-  return [lobbyLabel, team, roleLabel]
-    .concat(player.row)
-    .concat([round1_(effectiveScore_(player))]);
+function formatBalancedOutputSheet_(sheet, colCount, lastRow, dataRowCount) {
+  if (colCount < 1) return;
+
+  sheet.autoResizeColumns(1, colCount);
+
+  for (let c = 1; c <= colCount; c++) {
+    const min = c === 1 ? 72 : 150;
+    const max = c === 1 ? 96 : 260;
+    const w = Math.min(max, Math.max(min, sheet.getColumnWidth(c)));
+    sheet.setColumnWidth(c, w);
+  }
+
+  sheet.getRange(1, 1, lastRow, colCount).setVerticalAlignment('middle');
+
+  const header = sheet.getRange(2, 1, 1, colCount);
+  header.setFontWeight('bold');
+  header.setBackground('#f3f3f3');
+  header.setHorizontalAlignment('center');
+
+  sheet.getRange(1, 1, 1, colCount).setFontSize(9);
+  sheet.getRange(1, 1, 1, 1).setFontWeight('bold');
+
+  if (dataRowCount > 0) {
+    const body = sheet.getRange(3, 1, dataRowCount, colCount);
+    body.setVerticalAlignment('top');
+    sheet.getRange(3, 1, dataRowCount, 1).setHorizontalAlignment('center');
+    if (colCount > 1) {
+      sheet.getRange(3, 2, dataRowCount, colCount - 1).setWrap(true);
+    }
+  }
+
+  sheet.setFrozenRows(2);
 }
 
 function round1_(n) {
@@ -618,43 +680,23 @@ function round1_(n) {
 
 function exportTsvToDrive() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const sheets = getAllOutputSheets_(ss);
-  if (sheets.length === 0) {
-    SpreadsheetApp.getUi().alert(
-      '先に「ランダム分割」または「バランス分割」ボタンで分割してください'
-    );
+  const sheet = ss.getSheetByName(CONFIG.OUTPUT_SHEET);
+  if (!sheet) {
+    SpreadsheetApp.getUi().alert('先に「10人でチーム作成」または「12人でチーム作成」を実行してください');
     return;
   }
 
   const dateStr = Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy-MM-dd_HHmm');
-  const saved = [];
-
-  sheets.forEach(sheet => {
-    const data = sheet.getDataRange().getValues();
-    const tsv = data
-      .map(row => row.map(cellToTsvCell_).join('\t'))
-      .join('\n');
-
-    const suffix = sheet
-      .getName()
-      .replace(CONFIG.OUTPUT_SHEET_PREFIX, '')
-      .replace(CONFIG.BALANCED_OUTPUT_SHEET_PREFIX, '');
-    const isBalanced =
-      sheet.getName() === CONFIG.BALANCED_OUTPUT_SHEET ||
-      sheet.getName().startsWith(CONFIG.BALANCED_OUTPUT_SHEET_PREFIX + '_');
-    const prefix = isBalanced ? 'balanced' : 'players';
-    const fileName = `${prefix}_${dateStr}_${sheet.getName()}.tsv`;
-    DriveApp.createFile(fileName, tsv, MimeType.PLAIN_TEXT);
-    saved.push(fileName);
-  });
+  const data = sheet.getDataRange().getValues();
+  const tsv = data
+    .map(row => row.map(cellToTsvCell_).join('\t'))
+    .join('\n');
+  const fileName = `teams_${dateStr}.tsv`;
+  DriveApp.createFile(fileName, tsv, MimeType.PLAIN_TEXT);
 
   SpreadsheetApp.getUi().alert(
-    `TSVを ${saved.length} 件保存しました:\n\n${saved.join('\n')}\n\nDriveのマイドライブを確認してください`
+    `TSVを保存しました:\n\n${fileName}\n\nDriveのマイドライブを確認してください`
   );
-}
-
-function shuffleRows_(rows) {
-  return shuffleArray_(rows.slice());
 }
 
 function shuffleArray_(arr) {
@@ -665,10 +707,6 @@ function shuffleArray_(arr) {
     arr[j] = tmp;
   }
   return arr;
-}
-
-function chunkRows_(rows, size) {
-  return chunkArray_(rows, size);
 }
 
 function chunkArray_(arr, size) {
@@ -683,40 +721,6 @@ function deleteOutputSheets_(ss, prefix) {
   ss.getSheets()
     .filter(s => s.getName().startsWith(prefix))
     .forEach(s => ss.deleteSheet(s));
-}
-
-function writeChunkSheets_(ss, chunks, prefix) {
-  chunks.forEach((chunk, index) => {
-    const name = `${prefix}${index + 1}`;
-    const sheet = ss.insertSheet(name);
-    sheet.getRange(1, 1, 1, TSV_HEADERS.length).setValues([TSV_HEADERS]);
-    if (chunk.length > 0) {
-      sheet.getRange(2, 1, chunk.length, TSV_HEADERS.length).setValues(chunk);
-    }
-  });
-}
-
-function getOutputSheets_(ss) {
-  return getSheetsByPrefix_(ss, CONFIG.OUTPUT_SHEET_PREFIX);
-}
-
-function getAllOutputSheets_(ss) {
-  return getSheetsByPrefix_(ss, CONFIG.OUTPUT_SHEET_PREFIX).concat(
-    getSheetsByPrefix_(ss, CONFIG.BALANCED_OUTPUT_SHEET_PREFIX)
-  );
-}
-
-function getSheetsByPrefix_(ss, prefix) {
-  return ss
-    .getSheets()
-    .filter(s => s.getName().startsWith(prefix))
-    .sort((a, b) => sheetSortKey_(a.getName(), prefix) - sheetSortKey_(b.getName(), prefix));
-}
-
-function sheetSortKey_(name, prefix) {
-  const suffix = name.replace(prefix, '');
-  const num = parseInt(suffix, 10);
-  return isNaN(num) ? 9999 : num;
 }
 
 function normalizeHeader(header) {
