@@ -6,7 +6,8 @@
 const CONFIG = {
   SOURCE_SHEET: 'フォームの回答 1',
   OUTPUT_SHEET_PREFIX: 'TSV出力_',
-  BALANCED_OUTPUT_SHEET_PREFIX: 'バランス出力_',
+  BALANCED_OUTPUT_SHEET: 'バランス出力',
+  BALANCED_OUTPUT_SHEET_PREFIX: 'バランス出力',
   LOBBY_SPREAD_WEIGHT: 2,
   TIE_EPSILON: 2,
   DEFAULT_RANK_POINTS: 18,
@@ -39,7 +40,13 @@ const TSV_HEADERS = [
   'サポート希望',
 ];
 
-const BALANCED_HEADERS = TSV_HEADERS.concat(['チーム', 'スコア']);
+const ROLE_LABELS = {
+  tank: 'タンク',
+  dps: 'DPS',
+  support: 'サポート',
+};
+
+const BALANCED_SHEET_HEADERS = ['ロビー', 'チーム', '役割'].concat(TSV_HEADERS, ['スコア']);
 
 const PREFERENCE_MAP = {
   'いいえ': '×',
@@ -113,40 +120,57 @@ function createBalancedTsvSheet_(lobbySize) {
 
   optimizeLobbies_(fullLobbies, getSwapAttempts_(players.length));
 
-  const balancedLobbies = fullLobbies.map(lobby => {
-    const split = bestTeamSplit_(lobby, halfSize);
-    return {
+  const lobbyRoleCounts = getLobbyRoleCounts_(lobbySize);
+  const teamRoleSlots = getTeamRoleSlots_(halfSize);
+  const balancedLobbies = [];
+  const roleFailedLobbies = [];
+
+  fullLobbies.forEach(lobby => {
+    if (!canFormLobby_(lobby, lobbyRoleCounts)) {
+      roleFailedLobbies.push(lobby);
+      return;
+    }
+    if (!assignRolesInLobby_(lobby, lobbyRoleCounts)) {
+      roleFailedLobbies.push(lobby);
+      return;
+    }
+    const split = bestTeamSplitWithRoles_(lobby, teamRoleSlots);
+    if (!split) {
+      roleFailedLobbies.push(lobby);
+      return;
+    }
+    balancedLobbies.push({
       players: lobby,
       teamA: split.teamA,
       teamB: split.teamB,
       matchGap: split.cost,
       sumA: split.sumA,
       sumB: split.sumB,
-    };
+    });
   });
 
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   deleteOutputSheets_(ss, CONFIG.BALANCED_OUTPUT_SHEET_PREFIX);
-  writeBalancedLobbies_(ss, balancedLobbies, partialLobbies, lobbySize);
+  writeBalancedLobbies_(ss, balancedLobbies, partialLobbies.concat(roleFailedLobbies), lobbySize);
 
   const lobbySpread =
     fullLobbies.length > 1 ? computeLobbySpread_(fullLobbies) : 0;
   const matchGaps = balancedLobbies.map(l => l.matchGap).join(', ');
   const summaryLines = balancedLobbies.map((lobby, i) => {
-    const name = `${CONFIG.BALANCED_OUTPUT_SHEET_PREFIX}${i + 1}`;
-    return `${name}: A=${lobby.sumA} B=${lobby.sumB} 差=${lobby.matchGap}`;
+    return `ロビー${i + 1}: A=${round1_(lobby.sumA)} B=${round1_(lobby.sumB)} 差=${round1_(lobby.matchGap)}`;
   });
 
   let message =
-    `${lobbySize}人ロビー・バランス分割: ${balancedLobbies.length} タブ（合計 ${players.length}人）\n` +
+    `「${CONFIG.BALANCED_OUTPUT_SHEET}」タブに ${balancedLobbies.length} 試合分を出力しました（合計 ${players.length}人）\n` +
     `ロビー間スプレッド: ${lobbySpread}（小さいほど均等）\n` +
     `試合ごとのランク差: ${matchGaps || '—'}\n\n` +
     summaryLines.join('\n') +
     '\n\nもう一度押すと別の組み合わせになります';
 
-  if (partialLobbies.length > 0) {
-    const partialCount = partialLobbies.reduce((n, l) => n + l.length, 0);
-    message += `\n\n※ ${partialCount}人は人数が足りないためバランス分割していません（別タブ）`;
+  const extraLobbies = partialLobbies.concat(roleFailedLobbies);
+  if (extraLobbies.length > 0) {
+    const extraCount = extraLobbies.reduce((n, l) => n + l.length, 0);
+    message += `\n\n※ ${extraCount}人は人数不足またはロール割当不可のため「余り」に出力しています`;
   }
 
   SpreadsheetApp.getUi().alert(message);
@@ -184,19 +208,149 @@ function loadPlayerRows_() {
 }
 
 function toPlayer_(row) {
+  const roleScores = {
+    tank: roleScoreFromRank_(row[1]),
+    dps: roleScoreFromRank_(row[2]),
+    support: roleScoreFromRank_(row[3]),
+  };
   return {
     row: row,
-    score: playerScoreFromRow_(row),
+    score: playerScoreFromRow_(roleScores),
+    roleScores: roleScores,
+    prefs: {
+      tank: normalizePref_(row[4]),
+      dps: normalizePref_(row[5]),
+      support: normalizePref_(row[6]),
+    },
+    assignedRole: null,
   };
 }
 
-function playerScoreFromRow_(row) {
-  const tank = rankToPoints_(row[1]);
-  const dps = rankToPoints_(row[2]);
-  const support = rankToPoints_(row[3]);
+function normalizePref_(pref) {
+  if (pref === '×') return '×';
+  if (pref === '○') return '○';
+  return '○';
+}
+
+function roleScoreFromRank_(rankStr) {
+  const points = rankToPoints_(rankStr);
+  return points > 0 ? points : CONFIG.DEFAULT_RANK_POINTS;
+}
+
+function playerScoreFromRow_(roleScoresOrRow) {
+  let tank;
+  let dps;
+  let support;
+  if (roleScoresOrRow.tank !== undefined) {
+    tank = roleScoresOrRow.tank;
+    dps = roleScoresOrRow.dps;
+    support = roleScoresOrRow.support;
+  } else {
+    tank = rankToPoints_(roleScoresOrRow[1]);
+    dps = rankToPoints_(roleScoresOrRow[2]);
+    support = rankToPoints_(roleScoresOrRow[3]);
+  }
   const values = [tank, dps, support].filter(p => p > 0);
   if (values.length === 0) return CONFIG.DEFAULT_RANK_POINTS;
   return values.reduce((a, b) => a + b, 0) / values.length;
+}
+
+function canPlayRole_(player, role) {
+  return player.prefs[role] !== '×';
+}
+
+function effectiveScore_(player) {
+  if (player.assignedRole) return player.roleScores[player.assignedRole];
+  return player.score;
+}
+
+function getLobbyRoleCounts_(lobbySize) {
+  const half = lobbySize / 2;
+  const team = getTeamRoleSlots_(half);
+  return {
+    tank: team.tank * 2,
+    dps: team.dps * 2,
+    support: team.support * 2,
+  };
+}
+
+function getTeamRoleSlots_(halfSize) {
+  if (halfSize === 5) return { tank: 1, dps: 2, support: 2 };
+  if (halfSize === 6) return { tank: 2, dps: 2, support: 2 };
+  throw new Error(`未対応のチーム人数: ${halfSize}`);
+}
+
+function canFormLobby_(players, counts) {
+  return ['tank', 'dps', 'support'].every(role => {
+    const eligible = players.filter(p => canPlayRole_(p, role)).length;
+    return eligible >= counts[role];
+  });
+}
+
+function assignRolesInLobby_(players, counts) {
+  for (let attempt = 0; attempt < 30; attempt++) {
+    shuffleArray_(players);
+    players.forEach(p => {
+      p.assignedRole = null;
+    });
+    const ties = findRoleAssignments_(players, counts);
+    if (ties.length === 0) continue;
+
+    const pick = ties[Math.floor(Math.random() * ties.length)];
+    players.forEach((p, i) => {
+      p.assignedRole = pick[i];
+    });
+    return true;
+  }
+  return false;
+}
+
+function findRoleAssignments_(players, counts) {
+  const roles = ['tank', 'dps', 'support'];
+  const remaining = { tank: counts.tank, dps: counts.dps, support: counts.support };
+  const eps = CONFIG.TIE_EPSILON;
+  let minCost = Infinity;
+  const ties = [];
+
+  function assignmentCost_() {
+    let sum = 0;
+    let prefBonus = 0;
+    players.forEach(p => {
+      sum += p.roleScores[p.assignedRole];
+      if (p.prefs[p.assignedRole] === '○') prefBonus += 0.5;
+    });
+    return -(sum + prefBonus);
+  }
+
+  function search(i) {
+    if (i === players.length) {
+      const cost = assignmentCost_();
+      const snapshot = players.map(p => p.assignedRole);
+      if (cost < minCost - eps) {
+        minCost = cost;
+        ties.length = 0;
+        ties.push(snapshot);
+      } else if (cost <= minCost + eps) {
+        if (cost < minCost) minCost = cost;
+        ties.push(snapshot);
+      }
+      return;
+    }
+
+    const player = players[i];
+    for (let r = 0; r < roles.length; r++) {
+      const role = roles[r];
+      if (remaining[role] <= 0 || !canPlayRole_(player, role)) continue;
+      player.assignedRole = role;
+      remaining[role]--;
+      search(i + 1);
+      remaining[role]++;
+      player.assignedRole = null;
+    }
+  }
+
+  search(0);
+  return ties;
 }
 
 function rankToPoints_(rankStr) {
@@ -304,121 +458,158 @@ function optimizeLobbies_(lobbies, attempts) {
   }
 }
 
-function bestTeamSplit_(players, halfSize) {
-  const n = players.length;
-  if (n !== halfSize * 2) {
-    return {
-      teamA: players.slice(),
-      teamB: [],
-      cost: 0,
-      sumA: lobbySum_(players),
-      sumB: 0,
-    };
+function bestTeamSplitWithRoles_(players, teamSlots) {
+  const byRole = { tank: [], dps: [], support: [] };
+  players.forEach(p => {
+    if (!p.assignedRole || !byRole[p.assignedRole]) return;
+    byRole[p.assignedRole].push(p);
+  });
+
+  const needed = {
+    tank: teamSlots.tank,
+    dps: teamSlots.dps,
+    support: teamSlots.support,
+  };
+
+  if (
+    byRole.tank.length !== needed.tank * 2 ||
+    byRole.dps.length !== needed.dps * 2 ||
+    byRole.support.length !== needed.support * 2
+  ) {
+    return null;
   }
 
   const eps = CONFIG.TIE_EPSILON;
   let minCost = Infinity;
   const ties = [];
-  const chosen = [];
 
-  function evaluate() {
+  function evaluateSplit_(teamA) {
+    const teamASet = new Set(teamA);
+    const teamB = [];
     let sumA = 0;
     let sumB = 0;
-    const teamA = [];
-    const teamB = [];
-    const inA = {};
-    chosen.forEach(i => {
-      inA[i] = true;
-    });
-
-    for (let i = 0; i < n; i++) {
-      if (inA[i]) {
-        sumA += players[i].score;
-        teamA.push(players[i]);
+    players.forEach(p => {
+      if (teamASet.has(p)) {
+        sumA += effectiveScore_(p);
       } else {
-        sumB += players[i].score;
-        teamB.push(players[i]);
+        teamB.push(p);
+        sumB += effectiveScore_(p);
       }
-    }
-
+    });
     const cost = Math.abs(sumA - sumB);
+    const result = {
+      teamA: teamA.slice(),
+      teamB: teamB,
+      cost: cost,
+      sumA: sumA,
+      sumB: sumB,
+    };
     if (cost < minCost - eps) {
       minCost = cost;
       ties.length = 0;
-      ties.push({ teamA: teamA, teamB: teamB, cost: cost, sumA: sumA, sumB: sumB });
+      ties.push(result);
     } else if (cost <= minCost + eps) {
       if (cost < minCost) minCost = cost;
-      ties.push({ teamA: teamA, teamB: teamB, cost: cost, sumA: sumA, sumB: sumB });
+      ties.push(result);
     }
   }
 
-  function search(start, depth) {
-    if (depth === halfSize) {
-      evaluate();
-      return;
-    }
-    for (let i = start; i <= n - (halfSize - depth); i++) {
-      chosen[depth] = i;
-      search(i + 1, depth + 1);
-    }
-  }
+  forEachCombination_(byRole.tank, needed.tank, tankPick => {
+    forEachCombination_(byRole.dps, needed.dps, dpsPick => {
+      forEachCombination_(byRole.support, needed.support, supportPick => {
+        evaluateSplit_(tankPick.concat(dpsPick, supportPick));
+      });
+    });
+  });
 
-  search(0, 0);
-
-  if (ties.length === 0) {
-    return {
-      teamA: players.slice(0, halfSize),
-      teamB: players.slice(halfSize),
-      cost: 0,
-      sumA: lobbySum_(players.slice(0, halfSize)),
-      sumB: lobbySum_(players.slice(halfSize)),
-    };
-  }
-
+  if (ties.length === 0) return null;
   return ties[Math.floor(Math.random() * ties.length)];
 }
 
-function writeBalancedLobbies_(ss, balancedLobbies, partialLobbies, lobbySize) {
-  balancedLobbies.forEach((lobby, index) => {
-    const name = `${CONFIG.BALANCED_OUTPUT_SHEET_PREFIX}${index + 1}`;
-    const sheet = ss.insertSheet(name);
-    const lobbyTotal = Math.round(lobbySum_(lobby.players) * 10) / 10;
+function forEachCombination_(arr, k, fn) {
+  if (k === 0) {
+    fn([]);
+    return;
+  }
+  if (k > arr.length) return;
 
-    sheet
-      .getRange(1, 1, 1, 4)
-      .setValues([
-        [
-          `ロビー ${lobbySize}人`,
-          `A合計: ${round1_(lobby.sumA)}`,
-          `B合計: ${round1_(lobby.sumB)}`,
-          `試合差: ${round1_(lobby.matchGap)} / ロビー合計: ${lobbyTotal}`,
-        ],
-      ]);
-
-    sheet.getRange(2, 1, 1, BALANCED_HEADERS.length).setValues([BALANCED_HEADERS]);
-
-    const teamARows = lobby.teamA.map(p => playerToOutputRow_(p, 'A'));
-    const teamBRows = lobby.teamB.map(p => playerToOutputRow_(p, 'B'));
-    const dataRows = teamARows.concat(teamBRows);
-
-    if (dataRows.length > 0) {
-      sheet.getRange(3, 1, dataRows.length, BALANCED_HEADERS.length).setValues(dataRows);
+  const indices = [];
+  function search(start, depth) {
+    if (depth === k) {
+      fn(indices.map(i => arr[i]));
+      return;
     }
-  });
-
-  partialLobbies.forEach((lobby, index) => {
-    const name = `${CONFIG.BALANCED_OUTPUT_SHEET_PREFIX}余り${index + 1}`;
-    const sheet = ss.insertSheet(name);
-    sheet.getRange(1, 1, 1, TSV_HEADERS.length).setValues([TSV_HEADERS]);
-    const dataRows = lobby.map(p => p.row);
-    if (dataRows.length > 0) {
-      sheet.getRange(2, 1, dataRows.length, TSV_HEADERS.length).setValues(dataRows);
+    for (let i = start; i <= arr.length - (k - depth); i++) {
+      indices[depth] = i;
+      search(i + 1, depth + 1);
     }
+  }
+  search(0, 0);
+}
+
+function sortPlayersByRole_(players) {
+  const order = { tank: 0, dps: 1, support: 2 };
+  return players.slice().sort((a, b) => {
+    return (order[a.assignedRole] || 9) - (order[b.assignedRole] || 9);
   });
 }
 
-function playerToOutputRow_(player, team) {
-  return player.row.concat([team, round1_(player.score)]);
+function writeBalancedLobbies_(ss, balancedLobbies, partialLobbies, lobbySize) {
+  const sheet = ss.insertSheet(CONFIG.BALANCED_OUTPUT_SHEET);
+  const colCount = BALANCED_SHEET_HEADERS.length;
+  const dataRows = [];
+
+  balancedLobbies.forEach((lobby, index) => {
+    if (index > 0) {
+      dataRows.push(new Array(colCount).fill(''));
+    }
+    const lobbyNum = index + 1;
+    sortPlayersByRole_(lobby.teamA).forEach(p => {
+      dataRows.push(playerToBalancedRow_(p, 'A', lobbyNum));
+    });
+    sortPlayersByRole_(lobby.teamB).forEach(p => {
+      dataRows.push(playerToBalancedRow_(p, 'B', lobbyNum));
+    });
+  });
+
+  partialLobbies.forEach(lobby => {
+    if (dataRows.length > 0) {
+      dataRows.push(new Array(colCount).fill(''));
+    }
+    lobby.forEach(p => {
+      dataRows.push(playerToBalancedRow_(p, '', '余り'));
+    });
+  });
+
+  const lobbySpread =
+    balancedLobbies.length > 1
+      ? computeLobbySpread_(balancedLobbies.map(l => l.players))
+      : 0;
+  const totalPlayers =
+    balancedLobbies.reduce((n, l) => n + l.players.length, 0) +
+    partialLobbies.reduce((n, l) => n + l.length, 0);
+
+  sheet.getRange(1, 1, 1, 4).setValues([
+    [
+      `${lobbySize}人ロビー × ${balancedLobbies.length}試合`,
+      `合計 ${totalPlayers}人`,
+      `ロビー間スプレッド: ${lobbySpread}`,
+      Utilities.formatDate(new Date(), 'Asia/Tokyo', 'yyyy-MM-dd HH:mm'),
+    ],
+  ]);
+
+  sheet.getRange(2, 1, 1, colCount).setValues([BALANCED_SHEET_HEADERS]);
+
+  if (dataRows.length > 0) {
+    sheet.getRange(3, 1, dataRows.length, colCount).setValues(dataRows);
+  }
+}
+
+function playerToBalancedRow_(player, team, lobbyLabel) {
+  const roleLabel = player.assignedRole ? ROLE_LABELS[player.assignedRole] : '';
+  return [lobbyLabel, team, roleLabel]
+    .concat(player.row)
+    .concat([round1_(effectiveScore_(player))]);
 }
 
 function round1_(n) {
@@ -448,10 +639,11 @@ function exportTsvToDrive() {
       .getName()
       .replace(CONFIG.OUTPUT_SHEET_PREFIX, '')
       .replace(CONFIG.BALANCED_OUTPUT_SHEET_PREFIX, '');
-    const prefix = sheet.getName().startsWith(CONFIG.BALANCED_OUTPUT_SHEET_PREFIX)
-      ? 'balanced'
-      : 'players';
-    const fileName = `${prefix}_${dateStr}_tab${suffix}.tsv`;
+    const isBalanced =
+      sheet.getName() === CONFIG.BALANCED_OUTPUT_SHEET ||
+      sheet.getName().startsWith(CONFIG.BALANCED_OUTPUT_SHEET_PREFIX + '_');
+    const prefix = isBalanced ? 'balanced' : 'players';
+    const fileName = `${prefix}_${dateStr}_${sheet.getName()}.tsv`;
     DriveApp.createFile(fileName, tsv, MimeType.PLAIN_TEXT);
     saved.push(fileName);
   });
