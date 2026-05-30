@@ -26,6 +26,39 @@ const HEADER_MAP = {
   'タンク希望': 'タンク希望',
   'DPS希望': 'DPS希望',
   'サポート希望': 'サポート希望',
+  '参加': '参加',
+  '参加する': '参加',
+  '参加しますか': '参加',
+  '参加希望': '参加',
+  '今回参加': '参加',
+  'カスタムに参加': '参加',
+};
+
+/** 参加列あり → ここに含まれる値だけチーム作成に使う */
+const JOIN_YES_VALUES = {
+  'はい': true,
+  'yes': true,
+  'y': true,
+  '参加': true,
+  '参加する': true,
+  '参加します': true,
+  '○': true,
+  '◯': true,
+  'true': true,
+  '1': true,
+};
+
+/** 参加列あり → ここに含まれる値は除外（参加しない） */
+const JOIN_NO_VALUES = {
+  'いいえ': true,
+  'no': true,
+  'n': true,
+  '不参加': true,
+  '参加しない': true,
+  '×': true,
+  '✕': true,
+  'false': true,
+  '0': true,
 };
 
 const TSV_HEADERS = [
@@ -84,9 +117,10 @@ function createBalancedTsvSheet12() {
 }
 
 function createBalancedTsvSheet_(lobbySize) {
-  const rows = loadPlayerRows_();
-  if (!rows) return;
+  const loaded = loadPlayerRows_();
+  if (!loaded) return;
 
+  const rows = loaded.rows;
   const halfSize = lobbySize / 2;
   const players = rows.map(row => toPlayer_(row));
   const shuffled = shuffleArray_(players);
@@ -138,11 +172,18 @@ function createBalancedTsvSheet_(lobbySize) {
   });
 
   let message =
-    `「${CONFIG.OUTPUT_SHEET}」タブに ${balancedLobbies.length} 試合分を出力しました（合計 ${players.length}人）\n` +
+    `「${CONFIG.OUTPUT_SHEET}」タブに ${balancedLobbies.length} 試合分を出力しました（参加 ${players.length}人）\n` +
     `ロビー間スプレッド: ${lobbySpread}（小さいほど均等）\n` +
     `試合ごとのランク差: ${matchGaps || '—'}\n\n` +
     summaryLines.join('\n') +
     '\n\nもう一度押すと別の組み合わせになります';
+
+  if (loaded.skippedNotJoining > 0) {
+    message += `\n\n※ 参加しない ${loaded.skippedNotJoining}人は除外しました`;
+  }
+  if (loaded.skippedAmbiguous > 0) {
+    message += `\n※ 参加列が未記入 ${loaded.skippedAmbiguous}人は除外しました（「はい」で参加）`;
+  }
 
   const extraLobbies = partialLobbies.concat(roleFailedLobbies);
   if (extraLobbies.length > 0) {
@@ -151,6 +192,22 @@ function createBalancedTsvSheet_(lobbySize) {
   }
 
   SpreadsheetApp.getUi().alert(message);
+}
+
+function normalizeJoinValue_(value) {
+  return String(value)
+    .trim()
+    .toLowerCase()
+    .replace(/[\s　]/g, '');
+}
+
+function parseJoinIntent_(value, hasJoinColumn) {
+  if (!hasJoinColumn) return 'join';
+  const key = normalizeJoinValue_(value);
+  if (key === '') return 'ambiguous';
+  if (JOIN_YES_VALUES[key]) return 'join';
+  if (JOIN_NO_VALUES[key]) return 'skip';
+  return 'ambiguous';
 }
 
 function loadPlayerRows_() {
@@ -170,18 +227,46 @@ function loadPlayerRows_() {
   const allData = src.getRange(1, 1, lastRow, lastCol).getValues();
   const srcHeaders = allData[0].map(normalizeHeader);
   const colIndex = buildColumnIndex_(srcHeaders);
+  const hasJoinColumn = colIndex['参加'] !== undefined;
+
+  let skippedNotJoining = 0;
+  let skippedAmbiguous = 0;
 
   const rows = allData
     .slice(1)
-    .map(row => rowToTsv_(row, colIndex))
-    .filter(row => row[0] !== '');
+    .filter(row => {
+      const name = colIndex['名前'] !== undefined ? String(row[colIndex['名前']] || '').trim() : '';
+      if (name === '') return false;
+
+      const joinRaw = hasJoinColumn ? row[colIndex['参加']] : '';
+      const intent = parseJoinIntent_(joinRaw, hasJoinColumn);
+      if (intent === 'join') return true;
+      if (intent === 'skip') {
+        skippedNotJoining++;
+        return false;
+      }
+      skippedAmbiguous++;
+      return false;
+    })
+    .map(row => rowToTsv_(row, colIndex));
 
   if (rows.length === 0) {
-    SpreadsheetApp.getUi().alert('有効な回答がありません');
+    if (hasJoinColumn && skippedNotJoining + skippedAmbiguous > 0) {
+      SpreadsheetApp.getUi().alert(
+        '参加する人がいません。\n\n「参加」列に「はい」または「参加」と入力した人だけが対象です。'
+      );
+    } else {
+      SpreadsheetApp.getUi().alert('有効な回答がありません');
+    }
     return null;
   }
 
-  return rows;
+  return {
+    rows: rows,
+    skippedNotJoining: skippedNotJoining,
+    skippedAmbiguous: skippedAmbiguous,
+    hasJoinColumn: hasJoinColumn,
+  };
 }
 
 function toPlayer_(row) {
